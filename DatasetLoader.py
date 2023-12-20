@@ -10,6 +10,7 @@ import threading
 import time
 import math
 import glob
+import librosa
 import soundfile
 from scipy import signal
 from scipy.io import wavfile
@@ -29,7 +30,8 @@ def loadWAV(filename, max_frames, evalmode=True, num_eval=10):
     max_audio = max_frames * 160 + 240
 
     # Read wav file and convert to torch tensor
-    audio, sample_rate = soundfile.read(filename)
+    #audio, sample_rate = soundfile.read(filename)
+    audio, sample_rate = librosa.load(filename)
 
     audiosize = audio.shape[0]
 
@@ -162,6 +164,50 @@ class train_dataset_loader(Dataset):
         feat = numpy.concatenate(feat, axis=0)
 
         return torch.FloatTensor(feat), self.data_label[index]
+
+    def __len__(self):
+        return len(self.data_list)
+    
+    
+class pca_dataset_loader(Dataset):
+    def __init__(self, test_data_list, augment, musan_path, rir_path, max_frames, test_data_path, **kwargs):
+
+        self.augment_wav = AugmentWAV(musan_path=musan_path, rir_path=rir_path, max_frames = max_frames)
+
+        self.train_list = test_data_list
+        self.max_frames = max_frames;
+        self.musan_path = musan_path
+        self.rir_path   = rir_path
+        self.augment    = augment
+        
+        # Read training files
+        with open(test_data_list) as dataset_file:
+            lines = dataset_file.readlines();
+
+        # Make a dictionary of ID names and ID indices
+        dictkeys = list(set([x.split()[0] for x in lines]))
+        dictkeys.sort()
+        dictkeys = { key : ii for ii, key in enumerate(dictkeys) }
+
+        # Parse the training list into file names and ID indices
+        self.data_list  = []
+        self.data_label = []
+        self.data_id = []
+        
+        for lidx, line in enumerate(lines):
+            data = line.strip().split();
+
+            speaker_label = dictkeys[data[0]];
+            speaker_id = data[0];
+            filename = os.path.join(test_data_path,data[1]);
+            
+            self.data_label.append(speaker_label)
+            self.data_list.append(filename)
+            self.data_id.append(speaker_id)
+
+    def __getitem__(self, index):
+        audio = loadWAV(self.data_list[index], self.max_frames, evalmode=False)
+        return torch.FloatTensor(audio), self.data_label[index], self.data_id[index]
 
     def __len__(self):
         return len(self.data_list)

@@ -70,11 +70,16 @@ class ModelTrainer(object):
         self.mixedprec = mixedprec
 
         assert self.lr_step in ["epoch", "iteration"]
+        
+    def get_embedding(self, data):
+        self.__model__.eval()
+        with torch.no_grad():
+            out = self.__model__(data).detach().cpu()
+        return out
 
     # ## ===== ===== ===== ===== ===== ===== ===== =====
     # ## Train network
     # ## ===== ===== ===== ===== ===== ===== ===== =====
-
     def train_network(self, loader, verbose):
 
         self.__model__.train()

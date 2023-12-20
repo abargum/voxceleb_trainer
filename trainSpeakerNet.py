@@ -16,6 +16,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 warnings.simplefilter("ignore")
 
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.manifold import TSNE
+
+import wandb
+
 ## ===== ===== ===== ===== ===== ===== ===== =====
 ## Parse arguments
 ## ===== ===== ===== ===== ===== ===== ===== =====
@@ -34,7 +41,7 @@ parser.add_argument('--augment',        type=bool,  default=False,  help='Augmen
 parser.add_argument('--seed',           type=int,   default=10,     help='Seed for the random number generator')
 
 ## Training details
-parser.add_argument('--test_interval',  type=int,   default=10,     help='Test and save every [test_interval] epochs')
+parser.add_argument('--test_interval',  type=int,   default=2,     help='Test and save every [test_interval] epochs')
 parser.add_argument('--max_epoch',      type=int,   default=500,    help='Maximum number of epochs')
 parser.add_argument('--trainfunc',      type=str,   default="",     help='Loss function')
 
@@ -51,7 +58,7 @@ parser.add_argument("--hard_rank",      type=int,   default=10,     help='Hard n
 parser.add_argument('--margin',         type=float, default=0.1,    help='Loss margin, only for some loss functions')
 parser.add_argument('--scale',          type=float, default=30,     help='Loss scale, only for some loss functions')
 parser.add_argument('--nPerSpeaker',    type=int,   default=1,      help='Number of utterances per speaker per batch, only for metric learning based losses')
-parser.add_argument('--nClasses',       type=int,   default=5994,   help='Number of speakers in the softmax layer, only for softmax-based losses')
+parser.add_argument('--nClasses',       type=int,   default=921,   help='Number of speakers in the softmax layer, only for softmax-based losses')
 
 ## Evaluation parameters
 parser.add_argument('--dcf_p_target',   type=float, default=0.05,   help='A priori probability of the specified target speaker')
@@ -65,8 +72,10 @@ parser.add_argument('--save_path',      type=str,   default="exps/exp1", help='P
 ## Training and test data
 parser.add_argument('--train_list',     type=str,   default="data/train_list.txt",  help='Train list')
 parser.add_argument('--test_list',      type=str,   default="data/test_list.txt",   help='Evaluation list')
-parser.add_argument('--train_path',     type=str,   default="data/voxceleb2", help='Absolute path to the train set')
-parser.add_argument('--test_path',      type=str,   default="data/voxceleb1", help='Absolute path to the test set')
+parser.add_argument('--test_data_list', type=str,   default="data/test_data_list.txt",   help='Evaluation list')
+parser.add_argument('--train_path',     type=str,   default="", help='Absolute path to the train set')
+parser.add_argument('--test_path',      type=str,   default="", help='Absolute path to the test set')
+parser.add_argument('--test_data_path', type=str,   default="", help='Absolute path to the test set')
 parser.add_argument('--musan_path',     type=str,   default="data/musan_split", help='Absolute path to the test set')
 parser.add_argument('--rir_path',       type=str,   default="data/RIRS_NOISES/simulated_rirs", help='Absolute path to the test set')
 
@@ -80,6 +89,7 @@ parser.add_argument('--sinc_stride',    type=int,   default=10,    help='Stride 
 
 ## For test only
 parser.add_argument('--eval',           dest='eval', action='store_true', help='Eval only')
+parser.add_argument('--pca',            dest='pca',  action='store_true', help='PCA only')
 
 ## Distributed and mixed precision training
 parser.add_argument('--port',           type=str,   default="8888", help='Port for distributed training, input as text')
@@ -139,6 +149,7 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.gpu == 0:
         ## Write args to scorefile
         scorefile   = open(args.result_save_path+"/scores.txt", "a+")
+        wandb.init(project="ASR-Trainer", name=f"{args.save_path.split('/')[-1]}")
 
     ## Initialise trainer and data loader
     train_dataset = train_dataset_loader(**vars(args))
@@ -171,7 +182,93 @@ def main_worker(gpu, ngpus_per_node, args):
 
     for ii in range(1,it):
         trainer.__scheduler__.step()
+    
+    ## Embeddings plot code - must run on single GPU
+    ## ---------------------------------------------
+    if args.pca == True:
+        pytorch_total_params = sum(p.numel() for p in s.module.__S__.parameters())
 
+        print('Total parameters: ',pytorch_total_params)
+        print('Test list',args.test_list)
+        
+        pca_dataset = pca_dataset_loader(**vars(args))
+        pca_sampler = train_dataset_sampler(pca_dataset, **vars(args))
+        
+        pca_loader = torch.utils.data.DataLoader(
+        pca_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.nDataLoaderThread,
+        sampler=pca_sampler,
+        pin_memory=False,
+        worker_init_fn=worker_init_fn,
+        drop_last=True)
+        
+        speaker_E = []
+        speaker_ID = []
+        
+        sample_amount = 950 #len(dataset)
+        
+        for i, rest in enumerate(pca_dataset):
+            if i <= sample_amount:
+                data, data_label, data_id = rest
+                emb = trainer.get_embedding(data)
+                speaker_E.append(emb)
+                speaker_ID.append(data_label)
+            else:
+                break
+                
+        speaker_E = np.vstack(speaker_E)
+      
+        print(np.array(speaker_E).shape)
+
+        # Create a dictionary to map unique speaker IDs to colors
+        unique_speakers = list(set(speaker_ID))
+        print("Speakers in test set:", len(unique_speakers))
+        colors = plt.cm.get_cmap('rainbow', len(unique_speakers))
+        color_dict = {speaker: colors(i) for i, speaker in enumerate(unique_speakers)}
+        
+        print("Creating PCA Plot")
+        pca = PCA(n_components=2)
+        components = pca.fit_transform(speaker_E)
+
+        fig, ax = plt.subplots()
+
+        # Scatter plot with different colors for each speaker ID
+        for i, speaker in enumerate(unique_speakers):
+            indices = [j for j, s in enumerate(speaker_ID) if s == speaker]
+            ax.scatter(components[indices, 0], components[indices, 1], label=speaker, color=color_dict[speaker])
+
+        # Display a legend outside the plot and make it wider horizontally
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', mode='expand', borderaxespad=0.)
+
+        plt.xlabel('Principal Component 1')
+        plt.ylabel('Principal Component 2')
+
+        plt.savefig('embeddings_pca.png', bbox_inches='tight')
+        plt.show()
+        
+        print("Creating TSNE Plot")
+        tsne = TSNE(n_components=2, random_state=42)
+        components_tsne = tsne.fit_transform(speaker_E)
+        
+        # Create a scatter plot with different colors for each speaker ID
+        fig, ax = plt.subplots()
+        for i, speaker in enumerate(unique_speakers):
+            indices = [j for j, s in enumerate(speaker_ID) if s == speaker]
+            ax.scatter(components_tsne[indices, 0], components_tsne[indices, 1], label=speaker, color=color_dict[speaker])
+
+        # Display a legend outside the plot and make it wider horizontally
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', mode='expand', borderaxespad=0.)
+
+        plt.xlabel('t-SNE Component 1')
+        plt.ylabel('t-SNE Component 2')
+
+        plt.savefig('embeddings_tsne.png', bbox_inches='tight')
+        plt.show()
+        
+        return
+    ## ---------------------------------------------
+        
     ## Evaluation code - must run on single GPU
     if args.eval == True:
 
@@ -234,6 +331,9 @@ def main_worker(gpu, ngpus_per_node, args):
 
                 print('\n',time.strftime("%Y-%m-%d %H:%M:%S"), "Epoch {:d}, VEER {:2.4f}, MinDCF {:2.5f}".format(it, result[1], mindcf))
                 scorefile.write("Epoch {:d}, VEER {:2.4f}, MinDCF {:2.5f}\n".format(it, result[1], mindcf))
+                
+                wandb.log({"V-EER": result[1],
+                           "MinDCF": mindcf})
 
                 trainer.saveParameters(args.model_save_path+"/model%09d.model"%it)
 
@@ -260,7 +360,7 @@ def main():
     os.makedirs(args.result_save_path, exist_ok=True)
 
     n_gpus = torch.cuda.device_count()
-
+    
     print('Python Version:', sys.version)
     print('PyTorch Version:', torch.__version__)
     print('Number of GPUs:', torch.cuda.device_count())
